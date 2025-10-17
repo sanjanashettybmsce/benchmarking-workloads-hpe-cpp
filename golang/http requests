@@ -1,0 +1,151 @@
+package main
+
+import (
+    "flag"
+    "fmt"
+    "net/http"
+    "os"
+    "runtime"
+    "sync"
+    "time"
+
+    "github.com/shirou/gopsutil/v3/cpu"
+    "github.com/shirou/gopsutil/v3/disk"
+    "github.com/shirou/gopsutil/v3/mem"
+    "github.com/shirou/gopsutil/v3/process"
+)
+
+const requestURL = "https://jsonplaceholder.typicode.com/todos/1"
+
+type result struct {
+    success    bool
+    latency    time.Duration
+    statusCode int
+}
+
+func worker(id int, jobs <-chan int, results chan<- result, wg *sync.WaitGroup) {
+    defer wg.Done()
+    client := &http.Client{}
+    for range jobs {
+        start := time.Now()
+        resp, err := client.Get(requestURL)
+        duration := time.Since(start)
+        if err != nil {
+            results <- result{false, duration, 0}
+            continue
+        }
+        resp.Body.Close()
+        results <- result{true, duration, resp.StatusCode}
+    }
+}
+
+func collectSystemSnapshot(label string) (float64, uint64, uint64, *disk.IOCountersStat, int32) {
+    cpuPercent, _ := cpu.Percent(0, false)
+    memStats, _ := mem.VirtualMemory()
+    ioCounters, _ := disk.IOCounters()
+    proc, _ := process.NewProcess(int32(os.Getpid()))
+
+    numThreads, _ := proc.NumThreads()
+    var ioStat *disk.IOCountersStat
+    for _, v := range ioCounters {
+        ioStat = &v
+        break
+    }
+    fmt.Printf("\n📈 %s System Snapshot:\n", label)
+    fmt.Printf("CPU Usage: %.2f%%\n", cpuPercent[0])
+    fmt.Printf("Memory Used: %.2f GB\n", float64(memStats.Used)/(1024*1024*1024))
+    fmt.Printf("Threads: %d | Goroutines: %d\n", numThreads, runtime.NumGoroutine())
+    return cpuPercent[0], memStats.Used, memStats.Used, ioStat, numThreads
+}
+
+func main() {
+    // Command-line flags
+    requests := flag.Int("requests", 10000, "Number of HTTP requests to send")
+    workers := flag.Int("workers", 20, "Number of worker goroutines")
+    flag.Parse()
+
+    fmt.Println("Workload 1: HTTP Concurrent Benchmark in Go")
+    fmt.Printf("Total Requests: %d | Goroutines: %d\n", *requests, *workers)
+    fmt.Printf("CPU Cores: %d | GOMAXPROCS: %d\n", runtime.NumCPU(), runtime.GOMAXPROCS(0))
+
+    // Initial system metrics
+    cpuBefore, memBefore, _, ioBefore, threadsBefore := collectSystemSnapshot("Before")
+
+    // Setup
+    jobs := make(chan int, *requests)
+    resultsChan := make(chan result, *requests)
+    var wg sync.WaitGroup
+
+    start := time.Now()
+
+    for i := 0; i < *workers; i++ {
+        wg.Add(1)
+        go worker(i, jobs, resultsChan, &wg)
+    }
+
+    for i := 0; i < *requests; i++ {
+        jobs <- i
+    }
+    close(jobs)
+
+    go func() {
+        wg.Wait()
+        close(resultsChan)
+    }()
+
+    var (
+        successCount int
+        failCount    int
+        minLatency   = time.Hour
+        maxLatency   time.Duration
+        totalLatency time.Duration
+    )
+
+    for res := range resultsChan {
+        if res.success {
+            successCount++
+        } else {
+            failCount++
+        }
+        if res.latency < minLatency {
+            minLatency = res.latency
+        }
+        if res.latency > maxLatency {
+            maxLatency = res.latency
+        }
+        totalLatency += res.latency
+    }
+
+    totalTime := time.Since(start)
+
+    cpuAfter, memAfter, _, ioAfter, threadsAfter := collectSystemSnapshot("After")
+
+    var readDelta, writeDelta uint64
+    var ioTimeDelta time.Duration
+    if ioBefore != nil && ioAfter != nil {
+        readDelta = ioAfter.ReadCount - ioBefore.ReadCount
+        writeDelta = ioAfter.WriteCount - ioBefore.WriteCount
+        ioTimeDelta = time.Duration(ioAfter.IoTime-ioBefore.IoTime) * time.Millisecond
+    }
+
+    fmt.Println("\nWorkload 1 Report")
+    fmt.Println("----------------------")
+    fmt.Printf("Success: %d | Failures: %d\n", successCount, failCount)
+    fmt.Printf("Total Time         : %v\n", totalTime)
+    fmt.Printf("Throughput         : %.2f requests/sec\n", float64(*requests)/totalTime.Seconds())
+    fmt.Printf("Min Response Time  : %v\n", minLatency)
+    fmt.Printf("Max Response Time  : %v\n", maxLatency)
+    fmt.Printf("Avg Response Time  : %v\n", totalLatency/time.Duration(*requests))
+
+    fmt.Println("\nSystem Metrics Summary")
+    fmt.Println("--------------------------")
+    fmt.Printf("CPU Usage (Before) : %.2f%%\n", cpuBefore)
+    fmt.Printf("CPU Usage (After)  : %.2f%%\n", cpuAfter)
+    fmt.Printf("Memory Used Before : %.2f MB\n", float64(memBefore)/(1024*1024))
+    fmt.Printf("Memory Used After  : %.2f MB\n", float64(memAfter)/(1024*1024))
+    fmt.Printf("Threads (Before)   : %d | Threads (After): %d\n", threadsBefore, threadsAfter)
+    fmt.Printf("Goroutines (Now)   : %d\n", runtime.NumGoroutine())
+    fmt.Printf("Disk Reads         : %d\n", readDelta)
+    fmt.Printf("Disk Writes        : %d\n", writeDelta)
+    fmt.Printf("Disk I/O Time      : %v\n", ioTimeDelta)
+}
