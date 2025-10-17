@@ -1,0 +1,181 @@
+import java.io.*;
+import java.lang.management.*;
+import java.net.URI;
+import java.net.http.*;
+import java.nio.file.*;
+import java.time.Duration;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+
+public class HTTPRequestN {
+
+
+    private static int TOTAL_REQUESTS = 1000;  // default
+    private static int CONCURRENT_REQUESTS = 10;  // default (max 30)
+    private static final String TARGET_URL = "https://jsonplaceholder.typicode.com/todos/1";
+
+
+    private static final AtomicInteger successCount = new AtomicInteger(0);
+    private static final AtomicInteger errorCount = new AtomicInteger(0);
+
+
+    private static long totalReadTime = 0;
+    private static long totalWriteTime = 0;
+    private static int totalReadCount = 0;
+    private static int totalWriteCount = 0;
+
+
+    public static void main(String[] args) throws Exception {
+        parseArguments(args);
+
+
+        System.out.println("Java Benchmark with Performance Metrics");
+        System.out.println("Total Requests: " + TOTAL_REQUESTS);
+        System.out.println("Concurrent Threads: " + CONCURRENT_REQUESTS);
+
+
+        long startTime = System.nanoTime();
+
+
+        logSystemMetrics("Before Execution");
+
+
+        HttpClient httpClient = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+
+
+        runBenchmark(httpClient);
+
+
+        long endTime = System.nanoTime();
+
+
+        logSystemMetrics("After Execution");
+        logIoMetrics();
+
+
+        System.out.println("\n===== Summary =====");
+        System.out.println("Success Responses: " + successCount.get());
+        System.out.println("Error Responses: " + errorCount.get());
+        System.out.println("Total Execution Time: " + (endTime - startTime) / 1_000_000 + " ms");
+    }
+
+
+    private static void parseArguments(String[] args) {
+        if (args.length >= 1) {
+            TOTAL_REQUESTS = Integer.parseInt(args[0]);
+        }
+        if (args.length >= 2) {
+            CONCURRENT_REQUESTS = Integer.parseInt(args[1]);
+            if (CONCURRENT_REQUESTS > 30) {
+                System.out.println("Concurrent threads cannot exceed 30. Setting to 30.");
+                CONCURRENT_REQUESTS = 30;
+            }
+        }
+    }
+
+
+    private static void runBenchmark(HttpClient httpClient) throws InterruptedException {
+        ExecutorService executor = Executors.newFixedThreadPool(CONCURRENT_REQUESTS);
+        CountDownLatch latch = new CountDownLatch(TOTAL_REQUESTS);
+
+
+        for (int i = 0; i < TOTAL_REQUESTS; i++) {
+            executor.submit(() -> {
+                try {
+                    trackReadOperation(() -> {
+                        try {
+                            HttpRequest request = HttpRequest.newBuilder()
+                                    .uri(URI.create(TARGET_URL))
+                                    .timeout(Duration.ofSeconds(30))
+                                    .GET()
+                                    .build();
+
+
+                            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+
+                            if (response.statusCode() == 200) {
+                                trackWriteOperation(() -> saveToFile(response.body()));
+                                successCount.incrementAndGet();
+                            } else {
+                                errorCount.incrementAndGet();
+                            }
+                        } catch (IOException | InterruptedException e) {
+                            errorCount.incrementAndGet();
+                        }
+                    });
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+
+        executor.shutdown();
+        if (!executor.awaitTermination(10, TimeUnit.MINUTES)) {
+            System.out.println("Executor did not terminate within timeout.");
+        }
+
+
+        latch.await();
+    }
+
+
+    private static void trackReadOperation(Runnable operation) {
+        long startTime = System.nanoTime();
+        operation.run();
+        long endTime = System.nanoTime();
+        totalReadTime += (endTime - startTime);
+        totalReadCount++;
+    }
+
+
+    private static void trackWriteOperation(Runnable operation) {
+        long startTime = System.nanoTime();
+        operation.run();
+        long endTime = System.nanoTime();
+        totalWriteTime += (endTime - startTime);
+        totalWriteCount++;
+    }
+
+
+    private static void saveToFile(String data) {
+        try (BufferedWriter writer = Files.newBufferedWriter(Paths.get("output.txt"),
+                StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+            writer.write(data);
+            writer.newLine();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+
+    private static void logSystemMetrics(String stage) {
+        System.out.println("\n===== System Metrics (" + stage + ") =====");
+        System.out.println("Active Threads: " + Thread.activeCount());
+
+
+        long memoryUsed = Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory();
+        System.out.println("Memory Used: " + memoryUsed / (1024 * 1024) + " MB");
+
+
+        if (ManagementFactory.getOperatingSystemMXBean() instanceof com.sun.management.OperatingSystemMXBean) {
+            var osBean = (com.sun.management.OperatingSystemMXBean)
+                    ManagementFactory.getOperatingSystemMXBean();
+            double cpuLoad = osBean.getProcessCpuLoad();
+            System.out.println("CPU Load: " + (cpuLoad >= 0 ? String.format("%.2f", cpuLoad * 100) + "%" : "Unavailable"));
+        }
+    }
+
+
+    private static void logIoMetrics() {
+        System.out.println("\n===== I/O Metrics =====");
+        System.out.println("Total Disk Read Operations: " + totalReadCount);
+        System.out.println("Total Disk Write Operations: " + totalWriteCount);
+        System.out.println("Total I/O Read Time: " + (totalReadTime / 1_000_000) + " ms");
+        System.out.println("Total I/O Write Time: " + (totalWriteTime / 1_000_000) + " ms");
+    }
+}
