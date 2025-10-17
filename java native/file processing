@@ -1,0 +1,170 @@
+import java.io.*;
+import java.lang.management.*;
+import java.nio.MappedByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+public class FileProcessorN {
+
+    private static final String TEST_DIR = "test_files";
+    private static final int MAX_WORKERS = 50;
+
+    private static long filesProcessed = 0;
+    private static long ioReadTime = 0;
+    private static long ioWriteTime = 0;
+    private static long totalBytesRead = 0;
+    private static long totalBytesWritten = 0;
+    private static long totalReadOperations = 0;
+    private static long totalWriteOperations = 0;
+    private static final ConcurrentHashMap<Long, Boolean> threadTracker = new ConcurrentHashMap<>();
+
+    public static void main(String[] args) {
+        if (args.length < 2) {
+            System.out.println("Usage: java FileProcessor <numFilesToProcess> <numThreads>");
+            return;
+        }
+
+        int numFilesToProcess = Integer.parseInt(args[0]);
+        int numThreads = Integer.parseInt(args[1]);
+
+        if (numThreads > MAX_WORKERS) {
+            System.out.println("Max allowed threads is " + MAX_WORKERS + ". Using " + MAX_WORKERS + ".");
+            numThreads = MAX_WORKERS;
+        }
+
+        long startTime = System.nanoTime();
+
+        // CPU & Memory usage before execution
+        MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+        MemoryUsage beforeMemory = memoryBean.getHeapMemoryUsage();
+        double beforeCpuLoad = getProcessCpuLoad();
+
+        File folder = new File(TEST_DIR);
+        File[] files = folder.listFiles((dir, name) -> name.endsWith(".txt"));
+        if (files == null || files.length == 0) {
+            System.out.println("No files found in directory.");
+            return;
+        }
+
+        files = Arrays.copyOfRange(files, 0, Math.min(numFilesToProcess, files.length));
+
+        ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+
+        for (File file : files) {
+            executor.submit(() -> processFile(file));
+        }
+
+        executor.shutdown();
+        try {
+            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException e) {
+            System.err.println("Execution interrupted.");
+        }
+
+        long totalTime = System.nanoTime() - startTime;
+
+        // CPU & Memory usage after execution
+        MemoryUsage afterMemory = memoryBean.getHeapMemoryUsage();
+        double afterCpuLoad = getProcessCpuLoad();
+
+        displayMetrics(totalTime, beforeMemory, afterMemory, beforeCpuLoad, afterCpuLoad);
+    }
+
+    public static void processFile(File file) {
+        try {
+            threadTracker.put(Thread.currentThread().getId(), true);
+
+            long ioReadStart = System.nanoTime();
+            byte[] fileBytes = Files.readAllBytes(file.toPath());
+            long bytesRead = fileBytes.length;
+            synchronized (FileProcessor.class) {
+                totalBytesRead += bytesRead;
+                totalReadOperations++;
+            }
+            ioReadTime += (System.nanoTime() - ioReadStart);
+
+            String processedData = new String(fileBytes).toUpperCase();
+
+            long ioWriteStart = System.nanoTime();
+            Path outputFile = Path.of(file.getAbsolutePath().replace(".txt", ".out"));
+            Files.writeString(outputFile, processedData);
+            long bytesWritten = processedData.getBytes().length;
+            synchronized (FileProcessor.class) {
+                totalBytesWritten += bytesWritten;
+                totalWriteOperations++;
+            }
+            ioWriteTime += (System.nanoTime() - ioWriteStart);
+
+            // Memory-mapped I/O for safe file editing
+            try (FileChannel channel = FileChannel.open(outputFile, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+                MappedByteBuffer buffer = channel.map(FileChannel.MapMode.READ_WRITE, 0, channel.size());
+                if (buffer.limit() >= 6) {
+                    buffer.put(0, (byte) 'P');
+                    buffer.put(1, (byte) 'R');
+                    buffer.put(2, (byte) 'O');
+                    buffer.put(3, (byte) 'C');
+                    buffer.put(4, (byte) 'E');
+                    buffer.put(5, (byte) 'S');
+                }
+            }
+
+            synchronized (FileProcessor.class) {
+                filesProcessed++;
+            }
+        } catch (IOException e) {
+            System.out.println("Error processing file: " + file.getName());
+        }
+    }
+
+    public static void displayMetrics(
+        long totalTime, MemoryUsage beforeMemory, MemoryUsage afterMemory,
+        double beforeCpuLoad, double afterCpuLoad
+    ) {
+        double totalSeconds = totalTime / 1_000_000_000.0;
+        double filesPerSecond = filesProcessed / totalSeconds;
+        int threadsUsed = threadTracker.size();
+
+        File root = new File("/");
+        long totalSpace = root.getTotalSpace() / (1024 * 1024);
+        long freeSpace = root.getFreeSpace() / (1024 * 1024);
+        long usedSpace = totalSpace - freeSpace;
+
+        System.out.println("\n🔹 Processing Complete!\n");
+        System.out.println(" Files Processed: " + filesProcessed);
+        System.out.println(" Total Time: " + String.format("%.2f", totalSeconds) + " seconds");
+        System.out.println(" Files Per Second: " + String.format("%.2f", filesPerSecond));
+        System.out.println(" Number of Threads Used: " + threadsUsed);
+
+        System.out.println("\n CPU Usage:");
+        System.out.println("CPU Load Before: " + String.format("%.2f", beforeCpuLoad * 100) + "%");
+        System.out.println("CPU Load After: " + String.format("%.2f", afterCpuLoad * 100) + "%");
+
+        System.out.println("\n Memory Usage:");
+        System.out.println("Memory Before: " + beforeMemory.getUsed() / 1024 + " KB");
+        System.out.println("Memory After: " + afterMemory.getUsed() / 1024 + " KB");
+        System.out.println("Heap Memory Used: " + (afterMemory.getUsed() - beforeMemory.getUsed()) / 1024 + " KB");
+
+        System.out.println("\n I/O Metrics:");
+        System.out.println("I/O Read Time: " + ioReadTime / 1_000_000 + " ms");
+        System.out.println("I/O Write Time: " + ioWriteTime / 1_000_000 + " ms");
+        System.out.println("Disk Read: " + totalBytesRead / 1024 + " KB");
+        System.out.println("Disk Write: " + totalBytesWritten / 1024 + " KB");
+        System.out.println("Disk Read Operations: " + totalReadOperations);
+        System.out.println("Disk Write Operations: " + totalWriteOperations);
+
+        System.out.println("\n💾 Disk Usage Metrics:");
+        System.out.println("Total Space: " + totalSpace + " MB");
+        System.out.println("Used Space: " + usedSpace + " MB");
+        System.out.println("Free Space: " + freeSpace + " MB");
+    }
+
+    private static double getProcessCpuLoad() {
+        if (ManagementFactory.getOperatingSystemMXBean() instanceof com.sun.management.OperatingSystemMXBean) {
+            return ((com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean()).getProcessCpuLoad();
+        }
+        return -1;
+    }
+}
+
