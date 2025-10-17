@@ -1,0 +1,146 @@
+import asyncio
+import aiohttp
+import time
+import csv
+import os
+import threading
+import psutil
+from statistics import mean
+from aiofiles import open as aio_open
+import pandas as pd
+
+# Constants
+TARGET_URL = "https://jsonplaceholder.typicode.com/todos/1"
+OUTPUT_FILE = "http_output.txt"
+ORIGINAL_CSV = "http_benchmark_results.csv"
+RERUN_CSV = "http_rerun_results.csv"
+
+# CPU Monitor Thread
+class CPUMonitor(threading.Thread):
+    def __init__(self, interval=0.5):
+        super().__init__()
+        self.interval = interval
+        self.running = True
+        self.usage = []
+
+    def run(self):
+        while self.running:
+            self.usage.append(psutil.cpu_percent(interval=self.interval))
+
+    def stop(self):
+        self.running = False
+
+# Async fetch
+async def fetch(session, url, stats):
+    start_read = time.time()
+    try:
+        async with session.get(url, timeout=30) as response:
+            end_read = time.time()
+            stats["read_time"] += (end_read - start_read)
+            stats["read_count"] += 1
+            if response.status == 200:
+                text = await response.text()
+                start_write = time.time()
+                async with aio_open(OUTPUT_FILE, 'a') as f:
+                    await f.write(text + '\n')
+                end_write = time.time()
+                stats["write_time"] += (end_write - start_write)
+                stats["write_count"] += 1
+                stats["success"] += 1
+            else:
+                stats["error"] += 1
+    except Exception:
+        stats["error"] += 1
+
+# Benchmark runner
+async def run_benchmark(requests, concurrency):
+    stats = {
+        "success": 0,
+        "error": 0,
+        "read_time": 0.0,
+        "write_time": 0.0,
+        "read_count": 0,
+        "write_count": 0
+    }
+    connector = aiohttp.TCPConnector(limit=concurrency)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [fetch(session, TARGET_URL, stats) for _ in range(requests)]
+        await asyncio.gather(*tasks)
+    return stats
+
+# Benchmark wrapper
+def benchmark(requests, concurrency):
+    if os.path.exists(OUTPUT_FILE):
+        os.remove(OUTPUT_FILE)
+
+    cpu_monitor = CPUMonitor()
+    cpu_monitor.start()
+
+    process = psutil.Process(os.getpid())
+    mem_before = process.memory_info().rss / (1024 * 1024)
+    threads_before = process.num_threads()
+
+    start_time = time.time()
+    stats = asyncio.run(run_benchmark(requests, concurrency))
+    end_time = time.time()
+
+    cpu_monitor.stop()
+    cpu_monitor.join()
+
+    mem_after = process.memory_info().rss / (1024 * 1024)
+    threads_after = process.num_threads()
+
+    return {
+        "Request Count": requests,
+        "Concurrency": concurrency,
+        "Execution Time (s)": round(end_time - start_time, 2),
+        "Avg CPU Usage (%)": round(mean(cpu_monitor.usage), 2) if cpu_monitor.usage else 0,
+        "Memory Before (MB)": round(mem_before, 2),
+        "Memory After (MB)": round(mem_after, 2),
+        "Total Disk Read Ops": stats["read_count"],
+        "Total Disk Write Ops": stats["write_count"],
+        "Total Read Time (ms)": round(stats["read_time"] * 1000, 2),
+        "Total Write Time (ms)": round(stats["write_time"] * 1000, 2),
+        "Success Count": stats["success"],
+        "Error Count": stats["error"],
+        "Threads Before": threads_before,
+        "Threads After": threads_after
+    }
+
+# Find failed runs from original CSV
+def load_failed_cases(csv_file):
+    if not os.path.exists(csv_file):
+        print(f"CSV file not found: {csv_file}")
+        return []
+
+    df = pd.read_csv(csv_file)
+    df["Total Responses"] = df["Success Count"] + df["Error Count"]
+    failed = df[df["Total Responses"] != df["Request Count"]]
+    return list(zip(failed["Request Count"], failed["Concurrency"]))
+
+# Run partial reruns
+def rerun_failed_cases():
+    failed_cases = load_failed_cases(ORIGINAL_CSV)
+
+    if not failed_cases:
+        print("No failed cases found.")
+        return
+
+    print("Re-running the following failed benchmarks:")
+    print(failed_cases)
+
+    results = []
+    for request_count, concurrency in failed_cases:
+        print(f"\nRunning benchmark: {request_count} requests with concurrency {concurrency}")
+        result = benchmark(request_count, concurrency)
+        results.append(result)
+
+    with open(RERUN_CSV, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(f"\nRerun complete. Results saved to: {RERUN_CSV}")
+
+if __name__ == "__main__":
+    rerun_failed_cases()
