@@ -1,0 +1,125 @@
+import os
+import time
+import asyncio
+import gc
+import tracemalloc
+from PIL import Image
+from concurrent.futures import ThreadPoolExecutor
+
+def load_image(path):
+    return Image.open(path).convert("RGB")
+
+def save_image(img, path):
+    img.save(path, "PNG")
+
+def convert_to_grayscale_section(img, gray_img, start_y, end_y):
+    width, height = img.size
+    for y in range(start_y, end_y):
+        for x in range(width):
+            r, g, b = img.getpixel((x, y))
+            gray = int(0.299 * r + 0.587 * g + 0.114 * b)
+            gray_img.putpixel((x, y), (gray, gray, gray))
+
+async def process_image(input_path, output_path, thread_count):
+    loop = asyncio.get_event_loop()
+
+    # I/O Read Time
+    start_read = time.time()
+    img = await loop.run_in_executor(None, load_image, input_path)
+    end_read = time.time()
+
+    width, height = img.size
+    gray_img = Image.new("RGB", (width, height))
+
+    # Processing Time
+    start_process = time.time()
+    rows_per_thread = (height + thread_count - 1) // thread_count
+    tasks = []
+    with ThreadPoolExecutor(max_workers=thread_count) as executor:
+        for i in range(thread_count):
+            start_y = i * rows_per_thread
+            end_y = min(start_y + rows_per_thread, height)
+            tasks.append(loop.run_in_executor(
+                executor,
+                convert_to_grayscale_section,
+                img, gray_img, start_y, end_y
+            ))
+        await asyncio.gather(*tasks)
+    end_process = time.time()
+
+    # I/O Write Time
+    start_write = time.time()
+    await loop.run_in_executor(None, save_image, gray_img, output_path)
+    end_write = time.time()
+
+    return {
+        "read_time": end_read - start_read,
+        "process_time": end_process - start_process,
+        "write_time": end_write - start_write,
+        "total_time": (end_write - start_read)
+    }
+
+async def process_batch(batch_size, thread_count, input_dir="images_1000"):
+    print(f"\n⚙️  Processing batch of {batch_size} images with {thread_count} threads...")
+
+    output_dir = f"output_{batch_size}_threads_{thread_count}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    image_files = sorted([f for f in os.listdir(input_dir) if f.endswith((".jpg", ".jpeg"))])[:batch_size]
+    image_paths = [os.path.join(input_dir, f) for f in image_files]
+
+    gc.collect()
+    tracemalloc.start()
+    gc_before = gc.get_count()
+    snapshot_before = tracemalloc.take_snapshot()
+
+    start_batch_time = time.time()
+    metrics = {
+        "read_time": 0,
+        "process_time": 0,
+        "write_time": 0,
+        "total_time": 0,
+    }
+
+    tasks = []
+    for path in image_paths:
+        base = os.path.splitext(os.path.basename(path))[0]
+        out_path = os.path.join(output_dir, f"{base}.png")
+        task = process_image(path, out_path, thread_count)
+        tasks.append(task)
+
+    results = await asyncio.gather(*tasks)
+    end_batch_time = time.time()
+
+    for result in results:
+        for key in metrics:
+            metrics[key] += result[key]
+
+    snapshot_after = tracemalloc.take_snapshot()
+    gc_after = gc.get_count()
+    memory_diff = snapshot_after.compare_to(snapshot_before, 'filename')
+    memory_total = sum([stat.size for stat in memory_diff])
+
+    print(f"Completed {batch_size} images with {thread_count} threads.")
+    print(f"\nPerformance Metrics:")
+    print(f"I/O Read Time (Total): {metrics['read_time']:.2f}s")
+    print(f"Processing Time (Total): {metrics['process_time']:.2f}s")
+    print(f"I/O Write Time (Total): {metrics['write_time']:.2f}s")
+    print(f"Total Execution Time (Batch): {end_batch_time - start_batch_time:.2f}s")
+
+    print(f"\nMemory Usage:")
+    print(f"Memory Allocated: {memory_total / 1024:.2f} KB")
+    print(f"Garbage Collections: {tuple(after - before for before, after in zip(gc_before, gc_after))}")
+
+    tracemalloc.stop()
+
+async def main():
+    thread_counts = [1, 10, 15, 20]
+    batch_sizes = [250, 500, 750, 1000]
+
+    for batch_size in batch_sizes:
+        for thread_count in thread_counts:
+            await process_batch(batch_size, thread_count)
+
+if __name__ == "__main__":
+    asyncio.run(main())
