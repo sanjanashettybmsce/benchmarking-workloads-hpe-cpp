@@ -1,0 +1,161 @@
+package main
+
+import (
+	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+)
+
+func main() {
+	batchSizes := []int{250, 500, 750, 1000}
+	threadCounts := []int{1, 10, 15, 20}
+	inputDir := "images_1000"
+
+	for _, batchSize := range batchSizes {
+    	imageFiles := getImageFiles(inputDir, batchSize)
+    	for _, threads := range threadCounts {
+        	fmt.Printf("\n Processing %d images with %d goroutine(s)...\n", batchSize, threads)
+        	outputDir := fmt.Sprintf("output_%d_threads_%d", batchSize, threads)
+        	err := os.MkdirAll(outputDir, os.ModePerm)
+        	if err != nil {
+            	fmt.Println("Error creating output directory:", err)
+            	continue
+        	}
+        	runBatch(imageFiles, threads, inputDir, outputDir)
+    	}
+	}
+}
+
+func getImageFiles(dir string, limit int) []string {
+	entries, _ := os.ReadDir(dir)
+	files := []string{}
+	for _, entry := range entries {
+    	if !entry.IsDir() && (strings.HasSuffix(strings.ToLower(entry.Name()), ".jpg") || strings.HasSuffix(strings.ToLower(entry.Name()), ".jpeg")) {
+        	files = append(files, entry.Name())
+        	if len(files) == limit {
+            	break
+        	}
+    	}
+	}
+	return files
+}
+
+func runBatch(images []string, threadCount int, inputDir, outputDir string) {
+	runtime.GOMAXPROCS(threadCount)
+
+	var memStart runtime.MemStats
+	runtime.ReadMemStats(&memStart)
+	start := time.Now()
+
+	var wg sync.WaitGroup
+	ioReadTotal := time.Duration(0)
+	processTotal := time.Duration(0)
+	ioWriteTotal := time.Duration(0)
+
+	var ioReadMutex, processMutex, ioWriteMutex sync.Mutex
+
+	for _, filename := range images {
+    	wg.Add(1)
+    	go func(filename string) {
+        	defer wg.Done()
+
+        	// --- I/O Read ---
+        	ioStart := time.Now()
+        	inputPath := filepath.Join(inputDir, filename)
+        	file, err := os.Open(inputPath)
+        	if err != nil {
+            	fmt.Println("Error opening:", inputPath, err)
+            	return
+        	}
+        	img, err := jpeg.Decode(file)
+        	file.Close()
+        	if err != nil {
+            	fmt.Println("Decode error:", inputPath, err)
+            	return
+        	}
+        	ioTime := time.Since(ioStart)
+        	ioReadMutex.Lock()
+        	ioReadTotal += ioTime
+        	ioReadMutex.Unlock()
+
+        	// --- Processing ---
+        	bounds := img.Bounds()
+        	grayImg := image.NewGray(bounds)
+        	rowsPerThread := (bounds.Dy() + threadCount - 1) / threadCount
+        	var pWg sync.WaitGroup
+        	processStart := time.Now()
+
+        	for i := 0; i < threadCount; i++ {
+            	startY := i * rowsPerThread
+            	endY := startY + rowsPerThread
+            	if endY > bounds.Max.Y {
+                	endY = bounds.Max.Y
+            	}
+            	pWg.Add(1)
+            	go func(startY, endY int) {
+                	defer pWg.Done()
+                	for y := startY; y < endY; y++ {
+                    	for x := bounds.Min.X; x < bounds.Max.X; x++ {
+                        	gray := color.GrayModel.Convert(img.At(x, y)).(color.Gray)
+                        	grayImg.Set(x, y, gray)
+                    	}
+                	}
+            	}(startY, endY)
+        	}
+        	pWg.Wait()
+        	processTime := time.Since(processStart)
+        	processMutex.Lock()
+        	processTotal += processTime
+        	processMutex.Unlock()
+
+        	// --- I/O Write ---
+        	writeStart := time.Now()
+        	base := strings.TrimSuffix(filepath.Base(filename), filepath.Ext(filename))
+        	outputPath := filepath.Join(outputDir, base+".png")
+        	outFile, err := os.Create(outputPath)
+        	if err != nil {
+            	fmt.Println("Error creating output file:", outputPath, err)
+            	return
+        	}
+        	err = png.Encode(outFile, grayImg)
+        	if err != nil {
+            	fmt.Println("Error encoding PNG:", outputPath, err)
+        	}
+        	outFile.Close()
+        	writeTime := time.Since(writeStart)
+        	ioWriteMutex.Lock()
+        	ioWriteTotal += writeTime
+        	ioWriteMutex.Unlock()
+
+    	}(filename)
+	}
+
+	wg.Wait()
+	totalTime := time.Since(start)
+
+	var memEnd runtime.MemStats
+	runtime.ReadMemStats(&memEnd)
+
+	// --- Metrics Output ---
+	fmt.Println("Batch Completed.")
+	fmt.Println("\nPerformance Metrics:")
+	fmt.Printf("I/O Read Time (Total): %v\n", ioReadTotal)
+	fmt.Printf("Processing Time (Total): %v\n", processTotal)
+	fmt.Printf("I/O Write Time (Total): %v\n", ioWriteTotal)
+	fmt.Printf("Total Execution Time (Batch): %v\n", totalTime)
+
+	fmt.Println("\n Memory Usage:")
+	fmt.Printf("Memory Allocated: %v KB\n", (memEnd.Alloc-memStart.Alloc)/1024)
+	fmt.Printf("Heap Memory Used: %v KB\n", (memEnd.HeapAlloc-memStart.HeapAlloc)/1024)
+	fmt.Printf("Garbage Collections: %v\n", memEnd.NumGC-memStart.NumGC)
+}
+
+
