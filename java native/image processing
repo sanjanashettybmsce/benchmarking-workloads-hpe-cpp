@@ -1,0 +1,184 @@
+import javax.imageio.ImageIO;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.File;
+import java.io.IOException;
+import java.lang.management.*;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.Arrays;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+
+public class MultiImageN {
+
+
+    public static void main(String[] args) {
+        if (args.length < 2) {
+            System.out.println("Usage: java MultiImage <numThreads (max 30)> <numRequests>");
+            return;
+        }
+
+
+        int numThreads = Math.min(Integer.parseInt(args[0]), 30);
+        int numRequests = Integer.parseInt(args[1]);
+
+
+        long startTime = System.nanoTime();
+
+
+        // Memory & CPU usage before execution
+        MemoryMXBean memoryBean = ManagementFactory.getMemoryMXBean();
+        MemoryUsage beforeMemory = memoryBean.getHeapMemoryUsage();
+        double beforeCpuLoad = getProcessCpuLoad();
+
+
+        // Disk Read/Write Count Before
+        long initialReadCount = getDiskReadCount();
+        long initialWriteCount = getDiskWriteCount();
+
+
+        File folder = new File("images");
+        File[] files = folder.listFiles((dir, name) -> name.endsWith(".jpeg"));
+
+
+        if (files == null || files.length == 0) {
+            System.out.println("No images found in the directory.");
+            return;
+        }
+
+
+        // Limit number of requests
+        files = Arrays.copyOfRange(files, 0, Math.min(numRequests, files.length));
+
+
+        // Track total threads used
+        AtomicInteger threadCount = new AtomicInteger(0);
+
+
+        ExecutorService executor = Executors.newFixedThreadPool(
+            numThreads,
+            new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    int count = threadCount.incrementAndGet(); // Track new thread creation
+                    System.out.println("Creating new thread: " + count);
+                    return new Thread(r);
+                }
+            }
+        );
+
+
+        long ioReadStart = System.nanoTime();
+        for (File file : files) {
+            executor.submit(() -> processImage(file));
+        }
+        long ioReadTime = System.nanoTime() - ioReadStart;
+
+
+        executor.shutdown();
+        try {
+            executor.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS);
+        } catch (InterruptedException e) {
+            System.err.println("Execution interrupted.");
+        }
+
+
+        // Memory & CPU usage after execution
+        MemoryUsage afterMemory = memoryBean.getHeapMemoryUsage();
+        double afterCpuLoad = getProcessCpuLoad();
+
+
+        // Disk Read/Write Count After
+        long finalReadCount = getDiskReadCount();
+        long finalWriteCount = getDiskWriteCount();
+
+
+        long totalTime = System.nanoTime() - startTime;
+
+
+        // ==== Results ====
+        System.out.println("\n===== Grayscale Conversion Completed Successfully! =====");
+
+
+        System.out.println("\n Performance Metrics:");
+        System.out.println("Total Execution Time: " + totalTime / 1_000_000 + " ms");
+        System.out.println("CPU Load Before: " + String.format("%.2f", beforeCpuLoad * 100) + "%");
+        System.out.println("CPU Load After: " + String.format("%.2f", afterCpuLoad * 100) + "%");
+
+
+        System.out.println("\n Thread Metrics:");
+        System.out.println("Configured Threads: " + numThreads);
+        System.out.println("Total Threads Used: " + threadCount.get());
+        System.out.println("Active Threads (After Completion): " + Thread.activeCount());
+
+
+        System.out.println("\nI/O Metrics:");
+        System.out.println("Total Files Processed: " + files.length);
+        System.out.println("I/O Read Time (Loading Images): " + ioReadTime / 1_000_000 + " ms");
+        System.out.println("Disk Read Count: " + (finalReadCount - initialReadCount));
+        System.out.println("Disk Write Count: " + (finalWriteCount - initialWriteCount));
+
+
+        System.out.println("\nMemory Usage:");
+        System.out.println("Memory Before: " + beforeMemory.getUsed() / 1024 + " KB");
+        System.out.println("Memory After: " + afterMemory.getUsed() / 1024 + " KB");
+        System.out.println("Heap Memory Used: " + (afterMemory.getUsed() - beforeMemory.getUsed()) / 1024 + " KB");
+    }
+
+
+    public static void processImage(File file) {
+        long ioWriteStart = System.nanoTime();
+        try {
+            BufferedImage img = ImageIO.read(file);
+            BufferedImage grayImg = new BufferedImage(img.getWidth(), img.getHeight(), BufferedImage.TYPE_BYTE_GRAY);
+
+
+            Graphics g = grayImg.getGraphics();
+            g.drawImage(img, 0, 0, null);
+            g.dispose();
+
+
+            File outputFile = new File("output/" + file.getName().replace(".jpeg", ".png"));
+            ImageIO.write(grayImg, "png", outputFile);
+        } catch (IOException e) {
+            System.out.println("Error processing image: " + file.getName());
+        }
+        long ioWriteTime = System.nanoTime() - ioWriteStart;
+        System.out.println("I/O Write Time (Saving " + file.getName() + "): " + ioWriteTime / 1_000_000 + " ms");
+    }
+
+
+    // Gets CPU load as a percentage
+    private static double getProcessCpuLoad() {
+        if (ManagementFactory.getOperatingSystemMXBean() instanceof com.sun.management.OperatingSystemMXBean) {
+            return ((com.sun.management.OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean()).getProcessCpuLoad();
+        }
+        return -1;
+    }
+
+
+    // Gets Disk Read Count (Linux-based)
+    private static long getDiskReadCount() {
+        try {
+            return Files.lines(Paths.get("/proc/diskstats")).count();
+        } catch (IOException e) {
+            return -1;
+        }
+    }
+
+
+    // Gets Disk Write Count (Linux-based)
+    private static long getDiskWriteCount() {
+        try {
+            return Files.lines(Paths.get("/proc/diskstats")).count();
+        } catch (IOException e) {
+            return -1;
+        }
+    }
+}
+
+
+
+
