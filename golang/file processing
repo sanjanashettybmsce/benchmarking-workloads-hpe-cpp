@@ -1,0 +1,150 @@
+package main
+
+import (
+    "flag"
+    "fmt"
+    "github.com/edsrzf/mmap-go"
+    "github.com/shirou/gopsutil/v3/cpu"
+    "github.com/shirou/gopsutil/v3/disk"
+    "github.com/shirou/gopsutil/v3/mem"
+    "github.com/shirou/gopsutil/v3/process"
+    "io/fs"
+    "os"
+    "path/filepath"
+    "runtime"
+    "strings"
+    "sync"
+    "time"
+)
+
+type fileJob struct {
+    path string
+}
+
+func collectSystemSnapshot(label string) (float64, uint64, uint64, *disk.IOCountersStat, int32) {
+    cpuPercent, _ := cpu.Percent(0, false)
+    memStats, _ := mem.VirtualMemory()
+    ioCounters, _ := disk.IOCounters()
+    proc, _ := process.NewProcess(int32(os.Getpid()))
+    numThreads, _ := proc.NumThreads()
+
+    var ioStat *disk.IOCountersStat
+    for _, v := range ioCounters {
+        ioStat = &v
+        break
+    }
+    fmt.Printf("\n%s System Snapshot:\n", label)
+    fmt.Printf("CPU Usage: %.2f%%\n", cpuPercent[0])
+    fmt.Printf("Memory Used: %.2f GB\n", float64(memStats.Used)/(1024*1024*1024))
+    fmt.Printf("Threads: %d | Goroutines: %d\n", numThreads, runtime.NumGoroutine())
+    return cpuPercent[0], memStats.Used, memStats.Used, ioStat, numThreads
+}
+
+func mmapProcess(filePath string) error {
+    f, err := os.OpenFile(filePath, os.O_RDWR, 0644)
+    if err != nil {
+        return err
+    }
+    defer f.Close()
+
+    mapped, err := mmap.Map(f, mmap.RDWR, 0)
+    if err != nil {
+        return err
+    }
+    defer mapped.Unmap()
+
+    // Convert to string and modify
+    content := strings.ToUpper(string(mapped))
+    copy(mapped, content)
+    return nil
+}
+
+func worker(id int, jobs <-chan fileJob, wg *sync.WaitGroup) {
+    defer wg.Done()
+    for job := range jobs {
+        err := mmapProcess(job.path)
+        if err != nil {
+            fmt.Printf("Error processing %s: %v\n", job.path, err)
+        }
+    }
+}
+
+func main() {
+    // Input arguments
+    var folder string
+    var numFiles int
+    var numWorkers int
+
+    flag.StringVar(&folder, "folder", "text_files", "Path to folder containing text files")
+    flag.IntVar(&numFiles, "files", 1000, "Number of text files to process")
+    flag.IntVar(&numWorkers, "workers", 10, "Number of worker goroutines")
+    flag.Parse()
+
+    // Read all files
+    allFiles := []string{}
+    _ = filepath.WalkDir(folder, func(path string, d fs.DirEntry, err error) error {
+        if !d.IsDir() && strings.HasSuffix(d.Name(), ".txt") {
+            allFiles = append(allFiles, path)
+        }
+        return nil
+    })
+
+    if len(allFiles) < numFiles {
+        fmt.Printf("Not enough files. Found %d files, need %d.\n", len(allFiles), numFiles)
+        return
+    }
+    selectedFiles := allFiles[:numFiles]
+
+    fmt.Printf("Workload 3: Large-Scale File Processing\n")
+    fmt.Printf("Processing %d files with %d goroutines from folder '%s'\n", numFiles, numWorkers, folder)
+
+    // System metrics before
+    cpuBefore, memBefore, _, ioBefore, threadsBefore := collectSystemSnapshot("Before")
+
+    start := time.Now()
+
+    jobs := make(chan fileJob, numFiles)
+    var wg sync.WaitGroup
+
+    // Spawn workers
+    for i := 0; i < numWorkers; i++ {
+        wg.Add(1)
+        go worker(i, jobs, &wg)
+    }
+
+    // Send jobs
+    for _, file := range selectedFiles {
+        jobs <- fileJob{path: file}
+    }
+    close(jobs)
+    wg.Wait()
+
+    // System metrics after
+    totalTime := time.Since(start)
+    cpuAfter, memAfter, _, ioAfter, threadsAfter := collectSystemSnapshot("After")
+
+    var readDelta, writeDelta uint64
+    var ioTimeDelta time.Duration
+    if ioBefore != nil && ioAfter != nil {
+        readDelta = ioAfter.ReadCount - ioBefore.ReadCount
+        writeDelta = ioAfter.WriteCount - ioBefore.WriteCount
+        ioTimeDelta = time.Duration(ioAfter.IoTime-ioBefore.IoTime) * time.Millisecond
+    }
+
+    // Final Report
+    fmt.Println("\nWorkload 3 Report")
+    fmt.Println("------------------------")
+    fmt.Printf("Files Processed     : %d\n", numFiles)
+    fmt.Printf("Total Time          : %v\n", totalTime)
+    fmt.Printf("Throughput           : %.2f files/sec\n", float64(numFiles)/totalTime.Seconds())
+    fmt.Println("\nSystem Metrics Summary")
+    fmt.Printf("CPU Usage (Before)     : %.2f%%\n", cpuBefore)
+    fmt.Printf("CPU Usage (After)      : %.2f%%\n", cpuAfter)
+    fmt.Printf("Memory Used Before     : %.2f MB\n", float64(memBefore)/(1024*1024))
+    fmt.Printf("Memory Used After      : %.2f MB\n", float64(memAfter)/(1024*1024))
+    fmt.Printf("Threads (Before → After): %d → %d\n", threadsBefore, threadsAfter)
+    fmt.Printf("Goroutines (Now)       : %d\n", runtime.NumGoroutine())
+    fmt.Printf("Disk Reads             : %d\n", readDelta)
+    fmt.Printf("Disk Writes            : %d\n", writeDelta)
+    fmt.Printf("Disk I/O Time          : %v\n", ioTimeDelta)
+}
