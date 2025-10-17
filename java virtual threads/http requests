@@ -1,0 +1,186 @@
+package org.example;
+
+import com.sun.management.OperatingSystemMXBean;
+
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.OptionalLong;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+public class VirtualThreadHttpBenchmark {
+
+    private static final String REQUEST_URL = "https://jsonplaceholder.typicode.com/todos/1";
+
+    public static void main(String[] args) throws Exception {
+        int[] requestCounts = {250, 500, 750, 1000};
+        int[] threadCounts = {1, 5, 10, 15, 20};
+
+        for (int threadCount : threadCounts) {
+            for (int totalRequests : requestCounts) {
+                System.out.println("\n===== Java Benchmark with Performance Metrics =====");
+                System.out.printf("Total Requests: %d\n", totalRequests);
+                System.out.printf("Concurrent Threads: %d\n", threadCount);
+
+                SystemMetrics beforeMetrics = SystemMetrics.capture("Before Execution");
+
+                BenchmarkResult result = runBenchmark(totalRequests, threadCount);
+
+                SystemMetrics afterMetrics = SystemMetrics.capture("After Execution");
+
+                System.out.println("\n===== System Metrics (Before Execution) =====");
+                beforeMetrics.print();
+
+                System.out.println("\n===== System Metrics (After Execution) =====");
+                afterMetrics.print();
+
+                System.out.println("\n===== I/O Metrics =====");
+                System.out.printf("Total Disk Read Operations: %d\n", afterMetrics.readOps - beforeMetrics.readOps);
+                System.out.printf("Total Disk Write Operations: %d\n", afterMetrics.writeOps - beforeMetrics.writeOps);
+                System.out.printf("Total I/O Read Time: %d ms\n", afterMetrics.ioTimeMS - beforeMetrics.ioTimeMS);
+                System.out.printf("Total I/O Write Time: %d ms\n", afterMetrics.ioWriteTimeMS - beforeMetrics.ioWriteTimeMS);
+
+                System.out.println("\n===== Summary =====");
+                System.out.printf("Success Responses: %d\n", result.successCount.get());
+                System.out.printf("Error Responses: %d\n", result.errorCount.get());
+                System.out.printf("Total Execution Time: %d ms\n", result.totalTime.toMillis());
+                System.out.printf("Throughput: %.2f requests/sec\n", totalRequests / (result.totalTime.toMillis() / 1000.0));
+                System.out.printf("Min Response Time: %d ms\n", result.minLatency);
+                System.out.printf("Max Response Time: %d ms\n", result.maxLatency);
+                System.out.printf("Avg Response Time: %.2f ms\n", result.latencies.stream().mapToLong(Long::longValue).average().orElse(0));
+            }
+        }
+    }
+
+    private static BenchmarkResult runBenchmark(int totalRequests, int threadCount) throws InterruptedException {
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+        CountDownLatch latch = new CountDownLatch(totalRequests);
+
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build();
+
+        List<Long> latencies = new CopyOnWriteArrayList<>();
+        AtomicInteger successCount = new AtomicInteger();
+        AtomicInteger errorCount = new AtomicInteger();
+
+        Instant start = Instant.now();
+
+        for (int i = 0; i < totalRequests; i++) {
+            executor.submit(() -> {
+                try {
+                    Instant reqStart = Instant.now();
+                    HttpRequest request = HttpRequest.newBuilder()
+                            .uri(URI.create(REQUEST_URL))
+                            .GET()
+                            .timeout(Duration.ofSeconds(30))
+                            .build();
+
+                    HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+                    long latency = Duration.between(reqStart, Instant.now()).toMillis();
+                    latencies.add(latency);
+                    successCount.incrementAndGet();
+                } catch (Exception e) {
+                    errorCount.incrementAndGet();
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        latch.await(5, TimeUnit.MINUTES);
+        executor.shutdown();
+
+        Instant end = Instant.now();
+        Duration totalTime = Duration.between(start, end);
+        OptionalLong min = latencies.stream().mapToLong(Long::longValue).min();
+        OptionalLong max = latencies.stream().mapToLong(Long::longValue).max();
+
+        return new BenchmarkResult(successCount, errorCount, latencies, totalTime, min.orElse(0), max.orElse(0));
+    }
+
+    private static class BenchmarkResult {
+        AtomicInteger successCount;
+        AtomicInteger errorCount;
+        List<Long> latencies;
+        Duration totalTime;
+        long minLatency;
+        long maxLatency;
+
+        public BenchmarkResult(AtomicInteger success, AtomicInteger error, List<Long> times, Duration totalTime, long min, long max) {
+            this.successCount = success;
+            this.errorCount = error;
+            this.latencies = times;
+            this.totalTime = totalTime;
+            this.minLatency = min;
+            this.maxLatency = max;
+        }
+    }
+
+    private static class SystemMetrics {
+        double cpuLoad;
+        long memoryUsedMB;
+        long readOps;
+        long writeOps;
+        long ioTimeMS;
+        long ioWriteTimeMS;
+        int threadCount;
+
+        static SystemMetrics capture(String label) {
+            OperatingSystemMXBean osBean = (OperatingSystemMXBean) ManagementFactory.getOperatingSystemMXBean();
+            ThreadMXBean threadBean = ManagementFactory.getThreadMXBean();
+
+            double cpu = osBean.getSystemCpuLoad() * 100;
+            long mem = (Runtime.getRuntime().totalMemory() - Runtime.getRuntime().freeMemory()) / (1024 * 1024);
+            int threads = threadBean.getThreadCount();
+            long read = 0, write = 0, ioReadTime = 0, ioWriteTime = 0;
+
+            try (BufferedReader reader = new BufferedReader(new FileReader("/proc/self/io"))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.startsWith("syscr:")) {
+                        read = Long.parseLong(line.split("\\s+")[1]);
+                    } else if (line.startsWith("syscw:")) {
+                        write = Long.parseLong(line.split("\\s+")[1]);
+                    } else if (line.startsWith("rchar:")) {
+                        ioReadTime = Long.parseLong(line.split("\\s+")[1]);
+                    } else if (line.startsWith("wchar:")) {
+                        ioWriteTime = Long.parseLong(line.split("\\s+")[1]);
+                    }
+                }
+            } catch (IOException e) {
+                System.out.println("Failed to read /proc/self/io");
+            }
+
+            return new SystemMetrics(cpu, mem, read, write, ioReadTime, ioWriteTime, threads);
+        }
+
+        public SystemMetrics(double cpu, long mem, long read, long write, long ioRead, long ioWrite, int threads) {
+            this.cpuLoad = cpu;
+            this.memoryUsedMB = mem;
+            this.readOps = read;
+            this.writeOps = write;
+            this.ioTimeMS = ioRead;
+            this.ioWriteTimeMS = ioWrite;
+            this.threadCount = threads;
+        }
+
+        public void print() {
+            System.out.printf("Active Threads: %d\n", threadCount);
+            System.out.printf("Memory Used: %d MB\n", memoryUsedMB);
+            System.out.printf("CPU Load: %.2f%%\n", cpuLoad);
+        }
+    }
+}
+
