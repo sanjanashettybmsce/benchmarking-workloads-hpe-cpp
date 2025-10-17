@@ -1,0 +1,210 @@
+
+package org.example;
+
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.lang.management.MemoryMXBean;
+import java.lang.management.OperatingSystemMXBean;
+import java.lang.management.ThreadMXBean;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.*;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.concurrent.atomic.AtomicLong;
+import java.io.BufferedReader;
+import java.io.FileReader;
+
+public class FileProcessor {
+    private static final AtomicInteger filesProcessed = new AtomicInteger(0);
+    private static final AtomicLong totalReadBytes = new AtomicLong(0);
+    private static final AtomicLong totalWrittenBytes = new AtomicLong(0);
+    private static long ioReadBefore = 0;
+    private static long ioWriteBefore = 0;
+    private static long ioReadAfter = 0;
+    private static long ioWriteAfter = 0;
+
+    private static class Metrics {
+        Instant startTime;
+        Instant endTime;
+        double cpuUsageBefore;
+        double cpuUsageAfter;
+        long memoryUsageBefore;
+        long memoryUsageAfter;
+        long peakMemoryUsage;
+        int threadCountBefore;
+        int threadCountAfter;
+        FileStore fileStore;
+    }
+
+    private static final Metrics metrics = new Metrics();
+    private static final Runtime runtime = Runtime.getRuntime();
+    private static final OperatingSystemMXBean osMXBean = ManagementFactory.getOperatingSystemMXBean();
+    private static final MemoryMXBean memoryMXBean = ManagementFactory.getMemoryMXBean();
+    private static final ThreadMXBean threadMXBean = ManagementFactory.getThreadMXBean();
+
+    public static void main(String[] args) {
+        try {
+            String folder = "test_files";
+            int[] fileCounts = {250, 500, 750, 1000};
+            int[] threadCounts = {1, 5, 10, 15, 20};
+
+            for (int numThreads : threadCounts) {
+                for (int numFiles : fileCounts) {
+                    filesProcessed.set(0);
+                    totalReadBytes.set(0);
+                    totalWrittenBytes.set(0);
+
+                    System.out.printf("\n Workload 3: Large-Scale File Processing\n");
+                    System.out.printf("Processing %d files with %d virtual threads from folder '%s'\n", numFiles, numThreads, folder);
+
+                    Path folderPath = Paths.get(folder);
+                    if (!Files.exists(folderPath)) {
+                        System.err.println("Folder does not exist: " + folder);
+                        return;
+                    }
+
+                    List<Path> allFiles = Files.walk(folderPath)
+                            .filter(Files::isRegularFile)
+                            .filter(p -> p.toString().endsWith(".txt"))
+                            .collect(Collectors.toList());
+
+                    if (allFiles.size() < numFiles) {
+                        System.err.printf(" Not enough files. Found %d files, need %d.\n", allFiles.size(), numFiles);
+                        return;
+                    }
+                    List<Path> selectedFiles = allFiles.subList(0, numFiles);
+
+                    captureProcIO(true);
+                    collectSystemSnapshot("Before", folderPath);
+                    metrics.startTime = Instant.now();
+
+                    try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+                        for (Path path : selectedFiles) {
+                            executor.submit(() -> {
+                                try {
+                                    processFile(path);
+                                } catch (IOException e) {
+                                    System.err.printf("Error processing %s: %s\n", path, e.getMessage());
+                                }
+                                return null;
+                            });
+                        }
+                    }
+
+                    metrics.endTime = Instant.now();
+                    collectSystemSnapshot("After", folderPath);
+                    captureProcIO(false);
+                    printFinalReport(numFiles, numThreads);
+                }
+            }
+        } catch (Exception e) {
+            System.err.println("Error: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static void processFile(Path filePath) throws IOException {
+        byte[] bytes = Files.readAllBytes(filePath);
+        totalReadBytes.addAndGet(bytes.length);
+
+        Path outPath = Path.of(filePath.toString() + ".out");
+        byte[] upperBytes = new String(bytes, StandardCharsets.UTF_8).toUpperCase().getBytes(StandardCharsets.UTF_8);
+        Files.write(outPath, upperBytes);
+        totalWrittenBytes.addAndGet(upperBytes.length);
+
+        filesProcessed.incrementAndGet();
+    }
+
+    private static void collectSystemSnapshot(String label, Path folderPath) {
+        try {
+            int totalThreads = threadMXBean.getThreadCount();
+            long usedMem = runtime.totalMemory() - runtime.freeMemory();
+            double cpu = osMXBean.getSystemLoadAverage();
+            FileStore store = Files.getFileStore(folderPath);
+
+            if (label.equals("Before")) {
+                metrics.memoryUsageBefore = usedMem;
+                metrics.cpuUsageBefore = cpu;
+                metrics.threadCountBefore = totalThreads;
+            } else {
+                metrics.memoryUsageAfter = usedMem;
+                metrics.cpuUsageAfter = cpu;
+                metrics.threadCountAfter = totalThreads;
+                metrics.peakMemoryUsage = Math.max(metrics.memoryUsageBefore, metrics.memoryUsageAfter);
+                metrics.fileStore = store;
+            }
+
+            System.out.printf("\n %s System Snapshot:\n", label);
+            System.out.printf("CPU Load Average: %.2f\n", cpu);
+            System.out.printf("Memory Used: %.2f MB\n", usedMem / (1024.0 * 1024));
+            System.out.printf("Threads: %d\n", totalThreads);
+        } catch (IOException e) {
+            System.err.println(" Error collecting disk metrics: " + e.getMessage());
+        }
+    }
+
+    private static void captureProcIO(boolean before) {
+        try (BufferedReader br = new BufferedReader(new FileReader("/proc/self/io"))) {
+            long read = 0, write = 0;
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.startsWith("read_bytes")) read = Long.parseLong(line.split(": ")[1]);
+                if (line.startsWith("write_bytes")) write = Long.parseLong(line.split(": ")[1]);
+            }
+            if (before) {
+                ioReadBefore = read;
+                ioWriteBefore = write;
+            } else {
+                ioReadAfter = read;
+                ioWriteAfter = write;
+            }
+        } catch (IOException e) {
+            System.err.println("Unable to read /proc/self/io");
+        }
+    }
+
+    private static void printFinalReport(int numFiles, int numThreads) {
+        Duration totalTime = Duration.between(metrics.startTime, metrics.endTime);
+        double seconds = totalTime.toMillis() / 1000.0;
+
+        try {
+            long totalSpace = metrics.fileStore.getTotalSpace() / (1024 * 1024);
+            long usedSpace = (metrics.fileStore.getTotalSpace() - metrics.fileStore.getUnallocatedSpace()) / (1024 * 1024);
+            long freeSpace = metrics.fileStore.getUsableSpace() / (1024 * 1024);
+
+            System.out.println("\nWorkload 3 Report");
+            System.out.println("------------------------");
+            System.out.printf(" Files Processed: %d\n", numFiles);
+            System.out.printf("Total Time: %.2f seconds\n", seconds);
+            System.out.printf("Files Per Second: %.2f\n", numFiles / seconds);
+            System.out.printf("Number of Threads Used: %d\n", numThreads);
+
+            System.out.println("\nCPU Usage:");
+            System.out.printf("CPU Load Before: %.2f%%\n", metrics.cpuUsageBefore);
+            System.out.printf("CPU Load After: %.2f%%\n", metrics.cpuUsageAfter);
+
+            System.out.println("\n Memory Usage:");
+            System.out.printf("Memory Before: %.0f KB\n", metrics.memoryUsageBefore / 1024.0);
+            System.out.printf("Memory After: %.0f KB\n", metrics.memoryUsageAfter / 1024.0);
+            System.out.printf("Heap Memory Used: %.0f KB\n", metrics.peakMemoryUsage / 1024.0);
+
+            System.out.println("\n I/O Metrics:");
+            System.out.printf("Disk Read: %.2f KB\n", (ioReadAfter - ioReadBefore) / 1024.0);
+            System.out.printf("Disk Write: %.2f KB\n", (ioWriteAfter - ioWriteBefore) / 1024.0);
+            System.out.printf("Bytes Read (Files): %.2f KB\n", totalReadBytes.get() / 1024.0);
+            System.out.printf("Bytes Written (Files): %.2f KB\n", totalWrittenBytes.get() / 1024.0);
+
+            System.out.println("\n Disk Usage Metrics:");
+            System.out.printf("Total Space: %d MB\n", totalSpace);
+            System.out.printf("Used Space: %d MB\n", usedSpace);
+            System.out.printf("Free Space: %d MB\n", freeSpace);
+        } catch (IOException e) {
+            System.err.println("Error retrieving final disk usage: " + e.getMessage());
+        }
+    }
+}
